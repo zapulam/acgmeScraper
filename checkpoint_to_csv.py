@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from logger import print_banner, print_run_config, print_success
-python scrape_acgme_contacts import CONTACT_COLUMNS, clean_email, clean_text, ensure_parent_dir
+from scrape_acgme_contacts import CONTACT_COLUMNS, clean_email, clean_text, ensure_parent_dir
 
 
 # --- Helper functions ---

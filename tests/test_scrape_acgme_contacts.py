@@ -9,11 +9,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import logger
-import scrape as scraper
+import scrape_acgme_contacts as scraper
 from logger import CLI_THEME, print_banner, print_run_config
 from checkpoint_to_csv import convert_checkpoint_to_csv
 from rich.console import Console
-python scrape_acgme_contacts import (
+from scrape_acgme_contacts import (
     ContactRow,
     ProgramResult,
     append_rows_to_checkpoint,
@@ -486,6 +486,103 @@ class CsvExportTests(unittest.TestCase):
 
 class WorkflowTests(unittest.TestCase):
     """Workflow tests for scraper orchestration."""
+
+    def test_detail_fetcher_clicks_prepared_result_link(
+            self,
+    ) -> None:
+        """Detail fetching clicks the prepared search result instead of direct goto."""
+        program = make_program(code="1520921155")
+        click_calls = []
+
+        class FakeLocator:
+            """Fake Playwright locator for a program detail link."""
+
+            @property
+            def first(
+                    self,
+            ) -> "FakeLocator":
+                """Return the fake first locator."""
+                return self
+
+            def count(
+                    self,
+            ) -> int:
+                """Return one matched link."""
+                return 1
+
+            def click(
+                    self,
+                    *,
+                    force: bool,
+                    timeout: int,
+            ) -> None:
+                """Record the click options used by the fetcher."""
+                click_calls.append(
+                    {
+                        "force": force,
+                        "timeout": timeout,
+                    }
+                )
+
+        class FakePage:
+            """Fake Playwright page for detail-link navigation tests."""
+
+            def __init__(
+                    self,
+            ) -> None:
+                """Initialize recorded page operations."""
+                self.selectors = []
+                self.waits = []
+                self.back_count = 0
+
+            def locator(
+                    self,
+                    selector: str,
+            ) -> FakeLocator:
+                """Record the link selector and return a fake locator."""
+                self.selectors.append(selector)
+                return FakeLocator()
+
+            def wait_for_load_state(
+                    self,
+                    state: str,
+                    timeout: int,
+            ) -> None:
+                """Record the requested page load state."""
+                self.waits.append(
+                    {
+                        "state": state,
+                        "timeout": timeout,
+                    }
+                )
+
+            def content(
+                    self,
+            ) -> str:
+                """Return synthetic loaded detail HTML."""
+                return "<html><body>Coordinator Information</body></html>"
+
+            def go_back(
+                    self,
+                    *,
+                    wait_until: str,
+                    timeout: int,
+            ) -> None:
+                """Record returning to the search results page."""
+                self.back_count += 1
+
+        fake_page = FakePage()
+        fetcher = scraper.PlaywrightDetailFetcher(delay=0.0)
+        fetcher.page = fake_page
+        fetcher.prepared_state = program.state
+
+        html = fetcher.fetch_detail_html(program)
+
+        self.assertIn("Coordinator Information", html)
+        self.assertEqual(click_calls, [{"force": True, "timeout": 30000}])
+        self.assertIn("orgCode=1520921155", fake_page.selectors[0])
+        self.assertEqual(fake_page.waits[0]["state"], "domcontentloaded")
+        self.assertEqual(fake_page.back_count, 1)
 
     def test_run_scrape_reuses_detail_fetcher_and_skips_completed_programs(
             self,

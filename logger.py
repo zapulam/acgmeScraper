@@ -91,8 +91,10 @@ def print_status(
     ) -> None:
     """Print one labeled status line with Rich styling."""
     console = active_console(console_obj)
-    if label: line = Text(f"[{label}] ", style=style)
-    else: line = Text(f"", style=style)
+    if label:
+        line = Text(f"[{label}] ", style=style)
+    else:
+        line = Text("", style=style)
     line.append(str(message))
     console.print(line)
 

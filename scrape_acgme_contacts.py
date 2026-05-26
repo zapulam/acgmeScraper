@@ -626,9 +626,16 @@ def detail_url_for_program(
         program: ProgramResult,
     ) -> str:
     """Return a normalized ACGME detail URL for a program result."""
-    parsed = urlparse(program.detail_url)
-    org_code = parse_qs(parsed.query).get("orgCode", [program.program_code])[0]
+    org_code = org_code_for_program(program)
     return f"{BASE_URL}/ads/Public/Programs/Detail?orgCode={org_code}"
+
+
+def org_code_for_program(
+        program: ProgramResult,
+    ) -> str:
+    """Return the ACGME organization code from a program detail URL or program code."""
+    parsed = urlparse(program.detail_url)
+    return parse_qs(parsed.query).get("orgCode", [program.program_code])[0]
 
 
 # --- Browser detail functions ---
@@ -727,22 +734,48 @@ class PlaywrightDetailFetcher:
         )
         self.prepared_state = state_name
 
+    def return_to_search_results(
+            self,
+    ) -> None:
+        """Return from a detail page to the prepared search results when possible."""
+        try:
+            self.page.go_back(
+                wait_until="domcontentloaded",
+                timeout=self.timeout_ms,
+            )
+        except Exception:
+            self.prepared_state = None
+
     def fetch_detail_html(
             self,
             program: ProgramResult,
         ) -> str:
-        """Fetch one ACGME program detail page using reusable Playwright state."""
+        """Fetch one ACGME detail page by clicking its prepared search result link."""
         self.prepare_state(program.state)
         polite_sleep(self.delay)
-        self.page.goto(
-            detail_url_for_program(program),
-            wait_until="domcontentloaded",
+        org_code = org_code_for_program(program)
+        detail_link = self.page.locator(
+            f'a[href*="Programs/Detail"][href*="orgCode={org_code}"]'
+        ).first
+        if detail_link.count() == 0:
+            self.prepared_state = None
+            raise RuntimeError(f"Could not find detail link for program {program.program_code}.")
+
+        detail_link.click(
+            force=True,
             timeout=self.timeout_ms,
         )
-        html = self.page.content()
-        if "Please return to the search page" in html:
-            raise RuntimeError("Detail page required search context and returned a bounce message.")
-        return html
+        self.page.wait_for_load_state(
+            "domcontentloaded",
+            timeout=self.timeout_ms,
+        )
+        try:
+            html = self.page.content()
+            if "Please return to the search page" in html:
+                raise RuntimeError("Detail page required search context and returned a bounce message.")
+            return html
+        finally:
+            self.return_to_search_results()
 
 
 # --- Core workflow functions ---
