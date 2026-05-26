@@ -235,7 +235,7 @@ def build_session() -> requests.Session:
 
 def concise_error_message(
         error: Exception | str,
-) -> str:
+    ) -> str:
     """Return the first useful line from an exception for terminal logging."""
     message = str(error)
     return clean_text(message.splitlines()[0] if message else "")
@@ -243,7 +243,7 @@ def concise_error_message(
 
 def full_error_message(
         error: Exception | str,
-) -> str:
+    ) -> str:
     """Return full diagnostic text stored for checkpoint error records."""
     return str(getattr(error, "full_error", error))
 
@@ -251,7 +251,7 @@ def full_error_message(
 def program_error_message(
         program: ProgramResult,
         error: Exception | str,
-) -> str:
+    ) -> str:
     """Return a concise program-scoped error without duplicating the code."""
     message = concise_error_message(error)
     prefix = f"{program.program_code}:"
@@ -262,7 +262,7 @@ def program_error_message(
 
 def cooldown_seconds_for_level(
         cooldown_level: int,
-) -> int:
+    ) -> int:
     """Return the throttle cooldown duration for a zero-based cooldown level."""
     index = min(cooldown_level, len(DETAIL_FAILURE_COOLDOWNS) - 1)
     return DETAIL_FAILURE_COOLDOWNS[index]
@@ -271,7 +271,7 @@ def cooldown_seconds_for_level(
 def sleep_for_throttle_cooldown(
         state_name: str,
         cooldown_seconds: int,
-) -> None:
+    ) -> None:
     """Pause scraping to let likely ACGME throttling clear."""
     minutes = max(1, round(cooldown_seconds / 60))
     print_warning(
@@ -447,7 +447,7 @@ def heading_text(
 
 def is_contact_section_title(
         title: str,
-) -> bool:
+    ) -> bool:
     """Return whether a section title is a contact-leadership section."""
     normalized = clean_text(title).lower()
     return normalized in CONTACT_SECTION_TITLES
@@ -829,7 +829,7 @@ class PlaywrightDetailFetcher:
             self,
             *,
             restart_browser: bool = False,
-    ) -> None:
+        ) -> None:
         """Clear prepared search state and optionally recreate browser resources."""
         self.prepared_state = None
         if restart_browser:
@@ -837,7 +837,7 @@ class PlaywrightDetailFetcher:
 
     def return_to_search_results(
             self,
-    ) -> None:
+        ) -> None:
         """Return from a detail page to the prepared search results when possible."""
         try:
             self.page.go_back(
@@ -849,7 +849,7 @@ class PlaywrightDetailFetcher:
 
     def mark_navigation_failure(
             self,
-    ) -> None:
+        ) -> None:
         """Track a detail navigation failure and recycle the browser if needed."""
         self.navigation_failures += 1
         self.invalidate_prepared_state(
@@ -858,14 +858,14 @@ class PlaywrightDetailFetcher:
 
     def mark_navigation_success(
             self,
-    ) -> None:
+        ) -> None:
         """Reset browser failure tracking after a successful detail scrape."""
         self.navigation_failures = 0
 
     def detail_content_is_ready(
             self,
             html: str,
-    ) -> bool:
+        ) -> bool:
         """Return whether fetched HTML appears to contain a loaded detail page."""
         if "Please return to the search page" in html:
             raise DetailPageNotReadyError(
@@ -876,7 +876,7 @@ class PlaywrightDetailFetcher:
     def wait_for_detail_content(
             self,
             org_code: str,
-    ) -> str:
+        ) -> str:
         """Wait for ACGME detail content using bounded polling."""
         deadline = time.monotonic() + (self.timeout_ms / 1000)
         last_url = ""
@@ -903,7 +903,7 @@ class PlaywrightDetailFetcher:
     def click_detail_link(
             self,
             program: ProgramResult,
-    ) -> None:
+        ) -> None:
         """Click a rendered detail link as a fallback navigation path."""
         org_code = org_code_for_program(program)
         detail_link = self.page.locator(
@@ -923,7 +923,7 @@ class PlaywrightDetailFetcher:
     def navigate_to_detail(
             self,
             program: ProgramResult,
-    ) -> None:
+        ) -> None:
         """Open a detail page from the prepared browser search context."""
         try:
             self.page.evaluate(
