@@ -487,74 +487,31 @@ class CsvExportTests(unittest.TestCase):
 class WorkflowTests(unittest.TestCase):
     """Workflow tests for scraper orchestration."""
 
-    def test_detail_fetcher_clicks_prepared_result_link(
+    def test_detail_fetcher_uses_browser_location_assignment(
             self,
     ) -> None:
-        """Detail fetching clicks the prepared search result instead of direct goto."""
+        """Detail fetching uses browser-side location assignment as the primary path."""
         program = make_program(code="1520921155")
-        click_calls = []
-
-        class FakeLocator:
-            """Fake Playwright locator for a program detail link."""
-
-            @property
-            def first(
-                    self,
-            ) -> "FakeLocator":
-                """Return the fake first locator."""
-                return self
-
-            def count(
-                    self,
-            ) -> int:
-                """Return one matched link."""
-                return 1
-
-            def click(
-                    self,
-                    *,
-                    force: bool,
-                    timeout: int,
-            ) -> None:
-                """Record the click options used by the fetcher."""
-                click_calls.append(
-                    {
-                        "force": force,
-                        "timeout": timeout,
-                    }
-                )
 
         class FakePage:
-            """Fake Playwright page for detail-link navigation tests."""
+            """Fake Playwright page for browser-side navigation tests."""
 
             def __init__(
                     self,
             ) -> None:
                 """Initialize recorded page operations."""
-                self.selectors = []
-                self.waits = []
+                self.assigned_paths = []
                 self.back_count = 0
+                self.url = "https://apps.acgme.org/ads/Public/Programs/Search"
 
-            def locator(
+            def evaluate(
                     self,
-                    selector: str,
-            ) -> FakeLocator:
-                """Record the link selector and return a fake locator."""
-                self.selectors.append(selector)
-                return FakeLocator()
-
-            def wait_for_load_state(
-                    self,
-                    state: str,
-                    timeout: int,
+                    script: str,
+                    path: str,
             ) -> None:
-                """Record the requested page load state."""
-                self.waits.append(
-                    {
-                        "state": state,
-                        "timeout": timeout,
-                    }
-                )
+                """Record browser-side navigation and update the fake URL."""
+                self.assigned_paths.append(path)
+                self.url = f"https://apps.acgme.org{path}"
 
             def content(
                     self,
@@ -579,10 +536,330 @@ class WorkflowTests(unittest.TestCase):
         html = fetcher.fetch_detail_html(program)
 
         self.assertIn("Coordinator Information", html)
-        self.assertEqual(click_calls, [{"force": True, "timeout": 30000}])
-        self.assertIn("orgCode=1520921155", fake_page.selectors[0])
-        self.assertEqual(fake_page.waits[0]["state"], "domcontentloaded")
+        self.assertEqual(
+            fake_page.assigned_paths,
+            ["/ads/Public/Programs/Detail?orgCode=1520921155"],
+        )
         self.assertEqual(fake_page.back_count, 1)
+
+    def test_detail_fetcher_falls_back_to_anchor_click(
+            self,
+    ) -> None:
+        """Detail fetching falls back to anchor click if location assignment fails."""
+        program = make_program(code="1520921155")
+        click_calls = []
+
+        class FakeLocator:
+            """Fake Playwright locator for fallback detail-link clicks."""
+
+            def __init__(
+                    self,
+                    page,
+            ) -> None:
+                """Initialize the fake locator with its owning page."""
+                self.page = page
+
+            @property
+            def first(
+                    self,
+            ) -> "FakeLocator":
+                """Return the fake first locator."""
+                return self
+
+            def count(
+                    self,
+            ) -> int:
+                """Return one matched fallback link."""
+                return 1
+
+            def click(
+                    self,
+                    *,
+                    force: bool,
+                    no_wait_after: bool,
+                    timeout: int,
+            ) -> None:
+                """Record fallback click options and update the fake URL."""
+                click_calls.append(
+                    {
+                        "force": force,
+                        "no_wait_after": no_wait_after,
+                        "timeout": timeout,
+                    }
+                )
+                self.page.url = "https://apps.acgme.org/ads/Public/Programs/Detail?orgCode=1520921155"
+
+        class FallbackPage:
+            """Fake page where assignment fails but anchor click succeeds."""
+
+            def __init__(
+                    self,
+            ) -> None:
+                """Initialize recorded page operations."""
+                self.selectors = []
+                self.back_count = 0
+                self.url = "https://apps.acgme.org/ads/Public/Programs/Search"
+
+            def evaluate(
+                    self,
+                    script: str,
+                    path: str,
+            ) -> None:
+                """Simulate browser-side assignment failure."""
+                raise RuntimeError("window.location.assign failed")
+
+            def locator(
+                    self,
+                    selector: str,
+            ) -> FakeLocator:
+                """Record the fallback link selector and return a fake locator."""
+                self.selectors.append(selector)
+                return FakeLocator(self)
+
+            def content(
+                    self,
+            ) -> str:
+                """Return synthetic loaded detail HTML."""
+                return "<html><body>Coordinator Information</body></html>"
+
+            def go_back(
+                    self,
+                    *,
+                    wait_until: str,
+                    timeout: int,
+            ) -> None:
+                """Record returning to the search results page."""
+                self.back_count += 1
+
+        fake_page = FallbackPage()
+        fetcher = scraper.PlaywrightDetailFetcher(delay=0.0)
+        fetcher.page = fake_page
+        fetcher.prepared_state = program.state
+
+        html = fetcher.fetch_detail_html(program)
+
+        self.assertIn("Coordinator Information", html)
+        self.assertEqual(
+            click_calls,
+            [{"force": True, "no_wait_after": True, "timeout": 30000}],
+        )
+        self.assertIn("orgCode=1520921155", fake_page.selectors[0])
+        self.assertEqual(fake_page.back_count, 1)
+
+    def test_detail_fetcher_refreshes_state_when_navigation_fails(
+            self,
+    ) -> None:
+        """Detail fetching refreshes prepared state once before final failure."""
+        program = make_program(code="1850821077")
+        prepare_calls = []
+
+        class MissingLocator:
+            """Fake fallback locator with no matching detail links."""
+
+            @property
+            def first(
+                    self,
+            ) -> "MissingLocator":
+                """Return the fake first locator."""
+                return self
+
+            def count(
+                    self,
+            ) -> int:
+                """Return no matched links."""
+                return 0
+
+        class MissingPage:
+            """Fake page where assignment and fallback navigation both fail."""
+
+            def evaluate(
+                    self,
+                    script: str,
+                    path: str,
+            ) -> None:
+                """Simulate browser-side assignment failure."""
+                raise RuntimeError("window.location.assign failed")
+
+            def locator(
+                    self,
+                    selector: str,
+            ) -> MissingLocator:
+                """Return a missing detail-link locator."""
+                return MissingLocator()
+
+        fetcher = scraper.PlaywrightDetailFetcher(delay=0.0)
+        fetcher.page = MissingPage()
+
+        def fake_prepare_state(
+                state_name: str,
+                *,
+                force: bool = False,
+        ) -> None:
+            """Record prepared state refreshes."""
+            prepare_calls.append(
+                {
+                    "state_name": state_name,
+                    "force": force,
+                }
+            )
+            fetcher.prepared_state = state_name
+
+        fetcher.prepare_state = fake_prepare_state
+
+        original_console = logger.CONSOLE
+        logger.CONSOLE = Console(
+            file=StringIO(),
+            force_terminal=False,
+            color_system=None,
+            theme=CLI_THEME,
+            width=120,
+        )
+        try:
+            with self.assertRaises(scraper.DetailNavigationError) as context:
+                fetcher.fetch_detail_html(program)
+        finally:
+            logger.CONSOLE = original_console
+
+        self.assertIn("detail navigation failed after 2 attempts", str(context.exception))
+        self.assertEqual(
+            prepare_calls,
+            [
+                {"state_name": "California", "force": False},
+                {"state_name": "California", "force": True},
+            ],
+        )
+        self.assertIsNone(fetcher.prepared_state)
+
+    def test_detail_fetcher_invalidates_state_after_click_timeout(
+            self,
+    ) -> None:
+        """Detail click failures invalidate prepared state and retry once."""
+        program = make_program(code="1880813049")
+        click_calls = []
+
+        class TimeoutLocator:
+            """Fake locator that times out during click."""
+
+            @property
+            def first(
+                    self,
+            ) -> "TimeoutLocator":
+                """Return the fake first locator."""
+                return self
+
+            def count(
+                    self,
+            ) -> int:
+                """Return one matched link."""
+                return 1
+
+            def click(
+                    self,
+                    *,
+                    force: bool,
+                    no_wait_after: bool,
+                    timeout: int,
+            ) -> None:
+                """Record click options and simulate a Playwright timeout."""
+                click_calls.append(
+                    {
+                        "force": force,
+                        "no_wait_after": no_wait_after,
+                        "timeout": timeout,
+                    }
+                )
+                raise TimeoutError("Locator.click: Timeout 30000ms exceeded.")
+
+        class TimeoutPage:
+            """Fake page where assignment fails and fallback click times out."""
+
+            def evaluate(
+                    self,
+                    script: str,
+                    path: str,
+            ) -> None:
+                """Simulate browser-side assignment failure."""
+                raise RuntimeError("window.location.assign failed")
+
+            def locator(
+                    self,
+                    selector: str,
+            ) -> TimeoutLocator:
+                """Return a timing-out locator."""
+                return TimeoutLocator()
+
+        fetcher = scraper.PlaywrightDetailFetcher(delay=0.0)
+        fetcher.page = TimeoutPage()
+        fetcher.prepared_state = program.state
+
+        def fake_prepare_state(
+                state_name: str,
+                force: bool = False,
+        ) -> None:
+            """Set prepared state without using a real browser."""
+            fetcher.prepared_state = state_name
+
+        fetcher.prepare_state = fake_prepare_state
+
+        original_console = logger.CONSOLE
+        logger.CONSOLE = Console(
+            file=StringIO(),
+            force_terminal=False,
+            color_system=None,
+            theme=CLI_THEME,
+            width=120,
+        )
+        try:
+            with self.assertRaises(scraper.DetailNavigationError) as context:
+                fetcher.fetch_detail_html(program)
+        finally:
+            logger.CONSOLE = original_console
+
+        self.assertIn("detail navigation failed after 2 attempts", str(context.exception))
+        self.assertEqual(len(click_calls), 2)
+        self.assertEqual(click_calls[0]["no_wait_after"], True)
+        self.assertIsNone(fetcher.prepared_state)
+
+    def test_wait_for_detail_content_tolerates_transient_navigation(
+            self,
+    ) -> None:
+        """Detail content polling waits through transient page.content errors."""
+        content_calls = []
+
+        class NavigatingPage:
+            """Fake page that is briefly unavailable while navigating."""
+
+            url = "https://apps.acgme.org/ads/Public/Programs/Detail?orgCode=0200500131"
+
+            def content(
+                    self,
+            ) -> str:
+                """Raise once before returning loaded detail HTML."""
+                content_calls.append("content")
+                if len(content_calls) == 1:
+                    raise RuntimeError("Page.content: Unable to retrieve content.")
+                return "<html><body>Coordinator Information</body></html>"
+
+        fetcher = scraper.PlaywrightDetailFetcher(
+            delay=0.0,
+            timeout_ms=1000,
+        )
+        fetcher.page = NavigatingPage()
+        original_sleep = scraper.time.sleep
+
+        def fake_sleep(
+                seconds: float,
+        ) -> None:
+            """Avoid waiting during transient content polling tests."""
+
+        scraper.time.sleep = fake_sleep
+        try:
+            html = fetcher.wait_for_detail_content("0200500131")
+        finally:
+            scraper.time.sleep = original_sleep
+
+        self.assertIn("Coordinator Information", html)
+        self.assertEqual(len(content_calls), 2)
 
     def test_run_scrape_reuses_detail_fetcher_and_skips_completed_programs(
             self,
@@ -710,6 +987,242 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(instances[0].fetches, ["0000000002"])
         self.assertTrue(instances[0].closed)
         self.assertEqual(checkpoint["completed_program_codes"], ["0000000001", "0000000002"])
+        self.assertEqual(len(checkpoint["rows"]), 1)
+
+    def test_run_scrape_cools_down_after_consecutive_detail_failures(
+            self,
+    ) -> None:
+        """Scraper waits after clustered detail failures and leaves them incomplete."""
+        programs = [
+            make_program(code="0000000001", name="Failed Program 1"),
+            make_program(code="0000000002", name="Failed Program 2"),
+            make_program(code="0000000003", name="Failed Program 3"),
+        ]
+        sleep_calls = []
+
+        class FailingDetailFetcher:
+            """Fake detail fetcher that always fails."""
+
+            def __init__(
+                    self,
+                    delay: float,
+            ) -> None:
+                """Initialize the fake fetcher."""
+                self.delay = delay
+
+            def __enter__(
+                    self,
+            ) -> "FailingDetailFetcher":
+                """Enter the fake context manager."""
+                return self
+
+            def __exit__(
+                    self,
+                    exc_type,
+                    exc_value,
+                    traceback,
+            ) -> None:
+                """Exit the fake context manager."""
+
+            def fetch_detail_html(
+                    self,
+                    program: ProgramResult,
+            ) -> str:
+                """Raise a synthetic detail navigation error."""
+                raise scraper.DetailNavigationError(
+                    f"{program.program_code}: detail navigation timed out after 2 attempts",
+                    full_error="full playwright call log",
+                )
+
+        def fake_get_search_page(
+                session,
+                delay,
+        ) -> str:
+            """Return a minimal search page fixture."""
+            return """
+            <input name="__RequestVerificationToken" value="token" />
+            <select id="stateFilter"><option value="5">California</option></select>
+            """
+
+        def fake_search_programs_for_state(
+                session,
+                state,
+                token,
+                delay,
+        ):
+            """Return synthetic state search results."""
+            return programs
+
+        def fake_sleep(
+                seconds: float,
+        ) -> None:
+            """Record cooldown sleeps without waiting in tests."""
+            sleep_calls.append(seconds)
+
+        originals = {
+            "get_search_page": scraper.get_search_page,
+            "search_programs_for_state": scraper.search_programs_for_state,
+            "PlaywrightDetailFetcher": scraper.PlaywrightDetailFetcher,
+            "sleep": scraper.time.sleep,
+        }
+        scraper.get_search_page = fake_get_search_page
+        scraper.search_programs_for_state = fake_search_programs_for_state
+        scraper.PlaywrightDetailFetcher = FailingDetailFetcher
+        scraper.time.sleep = fake_sleep
+        original_console = logger.CONSOLE
+        logger.CONSOLE = Console(
+            file=StringIO(),
+            force_terminal=False,
+            color_system=None,
+            theme=CLI_THEME,
+            width=120,
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                checkpoint_path = Path(temporary_directory) / "checkpoint.json"
+                args = SimpleNamespace(
+                    checkpoint=str(checkpoint_path),
+                    states=["CA"],
+                    delay=0.0,
+                    force=False,
+                    max_programs=None,
+                )
+
+                scraper.run_scrape(args)
+                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        finally:
+            scraper.get_search_page = originals["get_search_page"]
+            scraper.search_programs_for_state = originals["search_programs_for_state"]
+            scraper.PlaywrightDetailFetcher = originals["PlaywrightDetailFetcher"]
+            scraper.time.sleep = originals["sleep"]
+            logger.CONSOLE = original_console
+
+        self.assertEqual(sleep_calls, [300])
+        self.assertEqual(checkpoint["completed_program_codes"], [])
+        self.assertEqual(len(checkpoint["errors"]), 3)
+        self.assertEqual(checkpoint["errors"][0]["error"], "full playwright call log")
+
+    def test_run_scrape_success_resets_detail_failure_cooldown(
+            self,
+    ) -> None:
+        """A successful detail scrape resets the consecutive failure counter."""
+        programs = [
+            make_program(code="0000000001", name="Failed Program 1"),
+            make_program(code="0000000002", name="Failed Program 2"),
+            make_program(code="0000000003", name="Recovered Program"),
+            make_program(code="0000000004", name="Failed Program 4"),
+            make_program(code="0000000005", name="Failed Program 5"),
+        ]
+        sleep_calls = []
+
+        class MixedDetailFetcher:
+            """Fake detail fetcher with failures around one successful scrape."""
+
+            def __init__(
+                    self,
+                    delay: float,
+            ) -> None:
+                """Initialize the fake fetcher."""
+                self.delay = delay
+
+            def __enter__(
+                    self,
+            ) -> "MixedDetailFetcher":
+                """Enter the fake context manager."""
+                return self
+
+            def __exit__(
+                    self,
+                    exc_type,
+                    exc_value,
+                    traceback,
+            ) -> None:
+                """Exit the fake context manager."""
+
+            def fetch_detail_html(
+                    self,
+                    program: ProgramResult,
+            ) -> str:
+                """Return detail HTML only for the recovery program."""
+                if program.program_code == "0000000003":
+                    return """
+                    <div>
+                      <div class="panel panel-default">
+                        <div class="panel-heading"><h3>Coordinator Information</h3></div>
+                      </div>
+                      <ul class="list-unstyled"><li>Jane Doe</li><li>Program Coordinator</li></ul>
+                    </div>
+                    """
+                raise scraper.DetailNavigationError(
+                    f"{program.program_code}: detail navigation timed out after 2 attempts"
+                )
+
+        def fake_get_search_page(
+                session,
+                delay,
+        ) -> str:
+            """Return a minimal search page fixture."""
+            return """
+            <input name="__RequestVerificationToken" value="token" />
+            <select id="stateFilter"><option value="5">California</option></select>
+            """
+
+        def fake_search_programs_for_state(
+                session,
+                state,
+                token,
+                delay,
+        ):
+            """Return synthetic state search results."""
+            return programs
+
+        def fake_sleep(
+                seconds: float,
+        ) -> None:
+            """Record cooldown sleeps without waiting in tests."""
+            sleep_calls.append(seconds)
+
+        originals = {
+            "get_search_page": scraper.get_search_page,
+            "search_programs_for_state": scraper.search_programs_for_state,
+            "PlaywrightDetailFetcher": scraper.PlaywrightDetailFetcher,
+            "sleep": scraper.time.sleep,
+        }
+        scraper.get_search_page = fake_get_search_page
+        scraper.search_programs_for_state = fake_search_programs_for_state
+        scraper.PlaywrightDetailFetcher = MixedDetailFetcher
+        scraper.time.sleep = fake_sleep
+        original_console = logger.CONSOLE
+        logger.CONSOLE = Console(
+            file=StringIO(),
+            force_terminal=False,
+            color_system=None,
+            theme=CLI_THEME,
+            width=120,
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                checkpoint_path = Path(temporary_directory) / "checkpoint.json"
+                args = SimpleNamespace(
+                    checkpoint=str(checkpoint_path),
+                    states=["CA"],
+                    delay=0.0,
+                    force=False,
+                    max_programs=None,
+                )
+
+                scraper.run_scrape(args)
+                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        finally:
+            scraper.get_search_page = originals["get_search_page"]
+            scraper.search_programs_for_state = originals["search_programs_for_state"]
+            scraper.PlaywrightDetailFetcher = originals["PlaywrightDetailFetcher"]
+            scraper.time.sleep = originals["sleep"]
+            logger.CONSOLE = original_console
+
+        self.assertEqual(sleep_calls, [])
+        self.assertEqual(checkpoint["completed_program_codes"], ["0000000003"])
+        self.assertEqual(len(checkpoint["errors"]), 4)
         self.assertEqual(len(checkpoint["rows"]), 1)
 
 

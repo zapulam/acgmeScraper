@@ -68,6 +68,15 @@ DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
+DETAIL_READY_MARKERS = (
+    "Director Information",
+    "Coordinator Information",
+    "Accreditation Status",
+    "Program Information",
+)
+DETAIL_MAX_ATTEMPTS = 2
+DETAIL_FAILURE_COOLDOWN_THRESHOLD = 3
+DETAIL_FAILURE_COOLDOWNS = (300, 600, 900)
 
 
 @dataclass(frozen=True)
@@ -104,6 +113,28 @@ class ContactRow:
     email: str
     phone: str
     source_url: str
+
+
+class DetailNavigationError(RuntimeError):
+    """A concise detail-page navigation error with full diagnostic context."""
+
+    def __init__(
+            self,
+            message: str,
+            *,
+            full_error: str | None = None,
+        ) -> None:
+        """Initialize a detail navigation error with optional full diagnostics."""
+        super().__init__(message)
+        self.full_error = full_error or message
+
+
+class DetailLinkMissingError(RuntimeError):
+    """Raised when the prepared ACGME results page lacks a program detail link."""
+
+
+class DetailPageNotReadyError(RuntimeError):
+    """Raised when ACGME detail content is not ready before the timeout."""
 
 
 # --- Helper functions ---
@@ -200,6 +231,54 @@ def build_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
     return session
+
+
+def concise_error_message(
+        error: Exception | str,
+) -> str:
+    """Return the first useful line from an exception for terminal logging."""
+    message = str(error)
+    return clean_text(message.splitlines()[0] if message else "")
+
+
+def full_error_message(
+        error: Exception | str,
+) -> str:
+    """Return full diagnostic text stored for checkpoint error records."""
+    return str(getattr(error, "full_error", error))
+
+
+def program_error_message(
+        program: ProgramResult,
+        error: Exception | str,
+) -> str:
+    """Return a concise program-scoped error without duplicating the code."""
+    message = concise_error_message(error)
+    prefix = f"{program.program_code}:"
+    if message.startswith(prefix):
+        return message
+    return f"{program.program_code}: {message}"
+
+
+def cooldown_seconds_for_level(
+        cooldown_level: int,
+) -> int:
+    """Return the throttle cooldown duration for a zero-based cooldown level."""
+    index = min(cooldown_level, len(DETAIL_FAILURE_COOLDOWNS) - 1)
+    return DETAIL_FAILURE_COOLDOWNS[index]
+
+
+def sleep_for_throttle_cooldown(
+        state_name: str,
+        cooldown_seconds: int,
+) -> None:
+    """Pause scraping to let likely ACGME throttling clear."""
+    minutes = max(1, round(cooldown_seconds / 60))
+    print_warning(
+        f"Possible throttling detected; waiting {minutes} minutes before continuing."
+    )
+    time.sleep(cooldown_seconds)
+    print_warning(f"Cooldown complete; resuming {state_name}.")
 
 
 # --- HTML parsing functions ---
@@ -534,7 +613,7 @@ def record_error(
             "program_code": program.program_code if program else "",
             "program_name": program.program_name if program else "",
             "source_url": program.detail_url if program else "",
-            "error": str(error),
+            "error": full_error_message(error),
         }
     )
 
@@ -626,8 +705,15 @@ def detail_url_for_program(
         program: ProgramResult,
     ) -> str:
     """Return a normalized ACGME detail URL for a program result."""
+    return urljoin(BASE_URL, detail_path_for_program(program))
+
+
+def detail_path_for_program(
+        program: ProgramResult,
+    ) -> str:
+    """Return a relative ACGME detail path for browser-side navigation."""
     org_code = org_code_for_program(program)
-    return f"{BASE_URL}/ads/Public/Programs/Detail?orgCode={org_code}"
+    return f"/ads/Public/Programs/Detail?orgCode={org_code}"
 
 
 def org_code_for_program(
@@ -654,6 +740,7 @@ class PlaywrightDetailFetcher:
         self.browser: Any = None
         self.page: Any = None
         self.prepared_state: str | None = None
+        self.navigation_failures = 0
 
     def __enter__(
             self,
@@ -708,14 +795,18 @@ class PlaywrightDetailFetcher:
             self.playwright = None
         self.page = None
         self.prepared_state = None
+        self.navigation_failures = 0
 
     def prepare_state(
             self,
             state_name: str,
+            *,
+            force: bool = False,
         ) -> None:
         """Load ACGME search context for a state before opening detail pages."""
-        if self.prepared_state == state_name:
+        if not force and self.prepared_state == state_name:
             return
+        self.prepared_state = None
         self.ensure_started()
         self.page.goto(
             SEARCH_URL,
@@ -734,6 +825,16 @@ class PlaywrightDetailFetcher:
         )
         self.prepared_state = state_name
 
+    def invalidate_prepared_state(
+            self,
+            *,
+            restart_browser: bool = False,
+    ) -> None:
+        """Clear prepared search state and optionally recreate browser resources."""
+        self.prepared_state = None
+        if restart_browser:
+            self.close()
+
     def return_to_search_results(
             self,
     ) -> None:
@@ -746,36 +847,134 @@ class PlaywrightDetailFetcher:
         except Exception:
             self.prepared_state = None
 
-    def fetch_detail_html(
+    def mark_navigation_failure(
+            self,
+    ) -> None:
+        """Track a detail navigation failure and recycle the browser if needed."""
+        self.navigation_failures += 1
+        self.invalidate_prepared_state(
+            restart_browser=self.navigation_failures >= DETAIL_FAILURE_COOLDOWN_THRESHOLD,
+        )
+
+    def mark_navigation_success(
+            self,
+    ) -> None:
+        """Reset browser failure tracking after a successful detail scrape."""
+        self.navigation_failures = 0
+
+    def detail_content_is_ready(
+            self,
+            html: str,
+    ) -> bool:
+        """Return whether fetched HTML appears to contain a loaded detail page."""
+        if "Please return to the search page" in html:
+            raise DetailPageNotReadyError(
+                "Detail page required search context and returned a bounce message."
+            )
+        return any(marker in html for marker in DETAIL_READY_MARKERS)
+
+    def wait_for_detail_content(
+            self,
+            org_code: str,
+    ) -> str:
+        """Wait for ACGME detail content using bounded polling."""
+        deadline = time.monotonic() + (self.timeout_ms / 1000)
+        last_url = ""
+        last_length = 0
+        last_error = ""
+        while time.monotonic() < deadline:
+            try:
+                last_url = self.page.url
+                html = self.page.content()
+            except Exception as exc:
+                last_error = concise_error_message(exc)
+                time.sleep(0.5)
+                continue
+            last_length = len(html)
+            if org_code in last_url and self.detail_content_is_ready(html):
+                return html
+            time.sleep(0.5)
+        raise DetailPageNotReadyError(
+            f"Detail page did not become ready for orgCode={org_code}; "
+            f"last_url={last_url}; last_html_length={last_length}; "
+            f"last_error={last_error}"
+        )
+
+    def click_detail_link(
             self,
             program: ProgramResult,
-        ) -> str:
-        """Fetch one ACGME detail page by clicking its prepared search result link."""
-        self.prepare_state(program.state)
-        polite_sleep(self.delay)
+    ) -> None:
+        """Click a rendered detail link as a fallback navigation path."""
         org_code = org_code_for_program(program)
         detail_link = self.page.locator(
             f'a[href*="Programs/Detail"][href*="orgCode={org_code}"]'
         ).first
         if detail_link.count() == 0:
-            self.prepared_state = None
-            raise RuntimeError(f"Could not find detail link for program {program.program_code}.")
+            raise DetailLinkMissingError(
+                f"Could not find detail link for program {program.program_code}."
+            )
 
         detail_link.click(
             force=True,
+            no_wait_after=True,
             timeout=self.timeout_ms,
         )
-        self.page.wait_for_load_state(
-            "domcontentloaded",
-            timeout=self.timeout_ms,
-        )
+
+    def navigate_to_detail(
+            self,
+            program: ProgramResult,
+    ) -> None:
+        """Open a detail page from the prepared browser search context."""
         try:
-            html = self.page.content()
-            if "Please return to the search page" in html:
-                raise RuntimeError("Detail page required search context and returned a bounce message.")
-            return html
+            self.page.evaluate(
+                "(path) => { window.location.assign(path); }",
+                detail_path_for_program(program),
+            )
+        except Exception:
+            self.click_detail_link(program)
+
+    def fetch_detail_html_once(
+            self,
+            program: ProgramResult,
+        ) -> str:
+        """Fetch one ACGME detail page from an already prepared search context."""
+        org_code = org_code_for_program(program)
+        self.navigate_to_detail(program)
+        try:
+            return self.wait_for_detail_content(org_code)
         finally:
             self.return_to_search_results()
+
+    def fetch_detail_html(
+            self,
+            program: ProgramResult,
+        ) -> str:
+        """Fetch one ACGME detail page with one search-context refresh retry."""
+        errors: list[str] = []
+        for attempt in range(DETAIL_MAX_ATTEMPTS):
+            try:
+                self.prepare_state(
+                    program.state,
+                    force=attempt > 0,
+                )
+                polite_sleep(self.delay)
+                html = self.fetch_detail_html_once(program)
+                self.mark_navigation_success()
+                return html
+            except Exception as exc:
+                errors.append(str(exc))
+                self.mark_navigation_failure()
+                if attempt + 1 < DETAIL_MAX_ATTEMPTS:
+                    print_warning(
+                        f"{program.program_code}: detail navigation failed; "
+                        "refreshing search context."
+                    )
+
+        message = f"{program.program_code}: detail navigation failed after 2 attempts"
+        raise DetailNavigationError(
+            message,
+            full_error="\n\n".join(errors),
+        )
 
 
 # --- Core workflow functions ---
@@ -948,7 +1147,7 @@ def run_scrape(
             except Exception as exc:
                 record_error(checkpoint, None, f"state search: {state.name}", exc)
                 save_checkpoint(checkpoint_path, checkpoint)
-                print_error(f"{state.name}: {exc}")
+                print_error(f"{state.name}: {concise_error_message(exc)}")
                 continue
 
             remaining_programs = None
@@ -958,6 +1157,8 @@ def run_scrape(
             state_contacts = 0
             state_skipped = 0
             state_errors = 0
+            consecutive_detail_failures = 0
+            cooldown_level = 0
 
             print_info("")
             print_info(f"{state.name}: found {len(programs)} programs")
@@ -981,12 +1182,23 @@ def run_scrape(
                         mark_program_completed(checkpoint, program.program_code)
                         completed.add(program.program_code)
                         state_contacts += len(rows)
+                        consecutive_detail_failures = 0
+                        cooldown_level = 0
                         save_checkpoint(checkpoint_path, checkpoint)
                     except Exception as exc:
                         state_errors += 1
+                        consecutive_detail_failures += 1
                         record_error(checkpoint, program, "program detail", exc)
                         save_checkpoint(checkpoint_path, checkpoint)
-                        print_error(f"{program.program_code}: {exc}")
+                        print_error(program_error_message(program, exc))
+                        if consecutive_detail_failures >= DETAIL_FAILURE_COOLDOWN_THRESHOLD:
+                            cooldown_seconds = cooldown_seconds_for_level(cooldown_level)
+                            sleep_for_throttle_cooldown(
+                                state.name,
+                                cooldown_seconds,
+                            )
+                            consecutive_detail_failures = 0
+                            cooldown_level += 1
                     finally:
                         progress.update(
                             task_id,
