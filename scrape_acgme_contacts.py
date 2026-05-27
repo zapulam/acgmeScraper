@@ -1243,7 +1243,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--delay",
         type=float,
-        default=1.0,
+        default=20.0,
         help="Base delay in seconds between live ACGME requests.",
     )
     parser.add_argument(
