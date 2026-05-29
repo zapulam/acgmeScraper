@@ -675,7 +675,6 @@ def search_programs_for_state(
         delay: float,
     ) -> list[ProgramResult]:
     """Post a state search and parse program results from the response."""
-    polite_sleep(delay)
     response = fetch_with_retries(
         session,
         "POST",
